@@ -1,0 +1,6 @@
+.env
+mail_vault/
+inbox.json
+sent.json
+node_modules/
+*.log
