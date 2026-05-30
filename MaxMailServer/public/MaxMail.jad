@@ -1,0 +1,8 @@
+MIDlet-1: Midlet, , maxmail.Midlet
+MIDlet-Jar-Size: 22969
+MIDlet-Jar-URL: MaxMail.jar
+MIDlet-Name: MaxMail
+MIDlet-Vendor: Vendor
+MIDlet-Version: 1.0
+MicroEdition-Configuration: CLDC-1.1
+MicroEdition-Profile: MIDP-2.0
