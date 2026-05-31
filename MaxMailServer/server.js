@@ -1,5 +1,7 @@
 require('dotenv').config();
+const crypto = require('crypto');
 const express = require('express');
+const compression = require('compression');
 const bodyParser = require('body-parser');
 const fs = require('fs');
 const path = require('path');
@@ -10,15 +12,18 @@ const nodemailer = require('nodemailer');
 const app = express();
 const PORT = 3000;
 
+
 const STORAGE_PATH = './mail_vault';
 const ATTACH_PATH = path.join(STORAGE_PATH, 'attachments');
 const TEMP_UPLOAD_PATH = path.join(STORAGE_PATH, 'temp_uploads');
 const PUBLIC_PATH = './public';
+const PAIRED_DEVICES_FILE = './paired_devices.json';
 
 if (!fs.existsSync(STORAGE_PATH)) fs.mkdirSync(STORAGE_PATH);
 if (!fs.existsSync(ATTACH_PATH)) fs.mkdirSync(ATTACH_PATH, { recursive: true });
 if (!fs.existsSync(TEMP_UPLOAD_PATH)) fs.mkdirSync(TEMP_UPLOAD_PATH, { recursive: true });
 if (!fs.existsSync(PUBLIC_PATH)) fs.mkdirSync(PUBLIC_PATH);
+
 
 
 const GMAIL_USER = process.env.GMAIL_USER;
@@ -33,6 +38,7 @@ if (!GMAIL_USER || !GMAIL_APP_PASSWORD) {
     console.error('');
     process.exit(1);
 }
+
 
 
 const IMAP_CONFIG = {
@@ -60,6 +66,96 @@ const smtpTransport = nodemailer.createTransport({
     auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD }
 });
 
+
+
+let pairPin = null;
+let pairPinExpiry = 0;
+const SESSION_DURATION = 24 * 60 * 60 * 1000; // 24 
+const activeSessions = new Map();
+
+function loadPairedDevices() {
+    try {
+        if (fs.existsSync(PAIRED_DEVICES_FILE)) {
+            return JSON.parse(fs.readFileSync(PAIRED_DEVICES_FILE, 'utf8'));
+        }
+    } catch (e) {
+        console.error('[Auth] Error loading paired devices:', e.message);
+    }
+    return { devices: [] };
+}
+
+function savePairedDevices(data) {
+    fs.writeFileSync(PAIRED_DEVICES_FILE, JSON.stringify(data, null, 2));
+}
+
+function generateAuthId(token, minuteStr) {
+    return crypto.createHash('sha256').update(token + minuteStr).digest('hex');
+}
+
+function getMinuteStr(offsetMinutes) {
+    const d = new Date(Date.now() + (offsetMinutes || 0) * 60000);
+    const pad = n => String(n).padStart(2, '0');
+    return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+}
+
+
+if (process.env.PAIR_MODE === 'true') {
+    pairPin = String(Math.floor(100000 + Math.random() * 900000));
+    pairPinExpiry = Date.now() + 5 * 60 * 1000;
+}
+
+
+
+let imapConn = null;
+let imapLastUsed = 0;
+const IMAP_IDLE_TIMEOUT = 5 * 60 * 1000;
+
+async function withImap(fn) {
+    if (imapConn && (Date.now() - imapLastUsed > IMAP_IDLE_TIMEOUT)) {
+        try { imapConn.end(); } catch (e) { }
+        imapConn = null;
+    }
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            if (!imapConn) {
+                imapConn = await imaps.connect(IMAP_CONFIG);
+            }
+            imapLastUsed = Date.now();
+            return await fn(imapConn);
+        } catch (err) {
+            if (attempt === 0) {
+                try { if (imapConn) imapConn.end(); } catch (e) { }
+                imapConn = null;
+                continue;
+            }
+            throw err;
+        }
+    }
+}
+
+
+
+const listCache = new Map();
+const CACHE_TTL = 30 * 1000;
+
+function getCachedList(key) {
+    const entry = listCache.get(key);
+    if (entry && (Date.now() - entry.time) < CACHE_TTL) return entry.data;
+    listCache.delete(key);
+    return null;
+}
+
+function setCacheList(key, data) {
+    listCache.set(key, { data, time: Date.now() });
+}
+
+function invalidateCache() {
+    listCache.clear();
+}
+
+
+
 const staticOptions = {
     setHeaders: (res, filePath) => {
         if (filePath.endsWith('.jad')) res.setHeader('Content-Type', 'text/vnd.sun.j2me.app-descriptor');
@@ -67,6 +163,7 @@ const staticOptions = {
     }
 };
 
+app.use(compression({ threshold: 256 }));
 app.use(express.static(PUBLIC_PATH, staticOptions));
 app.use(bodyParser.urlencoded({ extended: true }));
 
@@ -80,6 +177,19 @@ app.use((req, res, next) => {
     console.log(`[${new Date().toLocaleTimeString()}] ${req.method} ${req.url}`);
     next();
 });
+
+function requireAuth(req, res, next) {
+    const token = req.headers['x-auth-token'] || req.query.token;
+    if (!token) return res.status(401).json({ error: 'No auth token' });
+
+    const session = activeSessions.get(token);
+    if (!session || Date.now() > session.expiry) {
+        activeSessions.delete(token);
+        return res.status(401).json({ error: 'Session expired' });
+    }
+    next();
+}
+
 
 function decodeHeader(val) {
     if (!val) return '';
@@ -196,23 +306,84 @@ function sanitizeUnicodeBMP(obj) {
     return obj;
 }
 
-// ─── IMAP Operations ──────────────────────────────────────────────────────────
 
-/**
- * Fetch a paginated list of mail metadata from Gmail IMAP.
- * Only fetches headers — no body content, keeping it fast.
- *
- * @param {string} box   - 'inbox' | 'sent'
- * @param {number} page  - 1-based page number
- * @param {number} limit - messages per page
- * @param {string} query - optional search string (matches subject or sender)
- * @returns {Array} array of mail metadata objects
- */
+
+app.get('/', (req, res) => {
+    res.sendFile(path.resolve(PUBLIC_PATH, 'login.html'));
+});
+
+app.post('/pair', (req, res) => {
+    const pin = req.body.pin;
+
+    if (!pairPin || !pin) {
+        return res.status(401).json({ error: 'Pairing not active' });
+    }
+    if (Date.now() > pairPinExpiry) {
+        pairPin = null;
+        return res.status(401).json({ error: 'PIN expired' });
+    }
+    if (pin !== pairPin) {
+        return res.status(401).json({ error: 'Invalid PIN' });
+    }
+
+    const deviceToken = crypto.randomBytes(32).toString('hex');
+
+    const devices = loadPairedDevices();
+    devices.devices.push({
+        token: deviceToken,
+        pairedAt: new Date().toISOString()
+    });
+    savePairedDevices(devices);
+
+    // one-time use
+    pairPin = null;
+    pairPinExpiry = 0;
+
+    console.log('[Auth] New device paired successfully');
+    res.json({ token: deviceToken });
+});
+
+app.post('/login', (req, res) => {
+    const authId = req.body.authId;
+    if (!authId) return res.status(401).json({ error: 'Missing authId' });
+
+    const devices = loadPairedDevices();
+    if (devices.devices.length === 0) {
+        return res.status(401).json({ error: 'No paired devices' });
+    }
+
+    const minutes = [getMinuteStr(0), getMinuteStr(-1), getMinuteStr(1)];
+
+    let matched = false;
+    for (let di = 0; di < devices.devices.length; di++) {
+        const device = devices.devices[di];
+        for (let mi = 0; mi < minutes.length; mi++) {
+            const expected = generateAuthId(device.token, minutes[mi]);
+            if (expected === authId) {
+                matched = true;
+                break;
+            }
+        }
+        if (matched) break;
+    }
+
+    if (!matched) {
+        return res.status(401).json({ error: 'Auth failed' });
+    }
+
+    const sessionToken = crypto.randomBytes(32).toString('hex');
+    activeSessions.set(sessionToken, { expiry: Date.now() + SESSION_DURATION });
+
+    console.log('[Auth] Device logged in, session issued');
+    res.json({ session: sessionToken });
+});
+
+
+
+
 async function imapFetchList(box, page, limit, query) {
     const folder = GMAIL_FOLDER[box] || 'INBOX';
-    let conn;
-    try {
-        conn = await imaps.connect(IMAP_CONFIG);
+    return withImap(async (conn) => {
         await conn.openBox(folder);
 
         let criteria = ['UNDELETED'];
@@ -237,34 +408,22 @@ async function imapFetchList(box, page, limit, query) {
             const h = (headerPart && headerPart.body) ? headerPart.body : {};
 
             return {
-                id: String(msg.attributes.uid),
-                sender: extractSender(h.from ? h.from[0] : ''),
-                to: decodeHeader(h.to ? h.to[0] : ''),
-                subject: decodeHeader(h.subject ? h.subject[0] : '') || '(no subject)',
-                date: formatDate(h.date ? h.date[0] : ''),
-                read: (msg.attributes.flags || []).includes('\\Seen'),
-                hasAttachments: hasAttachmentsInStruct(msg.attributes.struct)
+                i: String(msg.attributes.uid),
+                f: extractSender(h.from ? h.from[0] : ''),
+                t: decodeHeader(h.to ? h.to[0] : ''),
+                s: decodeHeader(h.subject ? h.subject[0] : '') || '(no subject)',
+                d: formatDate(h.date ? h.date[0] : ''),
+                r: (msg.attributes.flags || []).includes('\\Seen'),
+                a: hasAttachmentsInStruct(msg.attributes.struct)
             };
         });
-
-    } finally {
-        if (conn) conn.end();
-    }
+    });
 }
 
-/**
- * Fetch a single full email by UID from Gmail IMAP.
- * Parses MIME, extracts plain text body, saves attachments to disk.
- *
- * @param {string} box - 'inbox' | 'sent'
- * @param {string} uid - the IMAP UID (used as our mail ID)
- * @returns {Object|null} full mail object or null if not found
- */
+
 async function imapFetchDetail(box, uid) {
     const folder = GMAIL_FOLDER[box] || 'INBOX';
-    let conn;
-    try {
-        conn = await imaps.connect(IMAP_CONFIG);
+    return withImap(async (conn) => {
         await conn.openBox(folder);
 
         const criteria = [['UID', `${uid}:${uid}`]];
@@ -300,7 +459,7 @@ async function imapFetchDetail(box, uid) {
                 if (!fs.existsSync(attPath)) {
                     fs.writeFileSync(attPath, att.content);
                 }
-                attachments.push({ name: att.filename, url: `/download/${safeName}` });
+                attachments.push({ n: att.filename, u: `/download/${safeName}` });
             }
         }
 
@@ -310,39 +469,30 @@ async function imapFetchDetail(box, uid) {
         }
 
         return {
-            id: String(uid),
-            sender: parsed.from ? parsed.from.text : '',
-            senderEmail: senderEmail,
-            to: parsed.to ? parsed.to.text : '',
-            subject: parsed.subject || '(no subject)',
-            date: formatDate(parsed.date ? parsed.date.toString() : ''),
-            body: bodyText,
-            read: (msg.attributes.flags || []).includes('\\Seen'),
-            attachments
+            i: String(uid),
+            f: parsed.from ? parsed.from.text : '',
+            e: senderEmail,
+            t: parsed.to ? parsed.to.text : '',
+            s: parsed.subject || '(no subject)',
+            d: formatDate(parsed.date ? parsed.date.toString() : ''),
+            b: bodyText,
+            r: (msg.attributes.flags || []).includes('\\Seen'),
+            at: attachments
         };
-
-    } finally {
-        if (conn) conn.end();
-    }
+    });
 }
 
 async function imapMarkRead(box, uid) {
     const folder = GMAIL_FOLDER[box] || 'INBOX';
-    let conn;
-    try {
-        conn = await imaps.connect(IMAP_CONFIG);
+    return withImap(async (conn) => {
         await conn.openBox(folder);
         await conn.addFlags(String(uid), ['\\Seen']);
-    } finally {
-        if (conn) conn.end();
-    }
+    });
 }
 
 async function imapMoveToTrash(box, uid) {
     const folder = GMAIL_FOLDER[box] || 'INBOX';
-    let conn;
-    try {
-        conn = await imaps.connect(IMAP_CONFIG);
+    return withImap(async (conn) => {
         await conn.openBox(folder);
 
         if (box === 'trash') {
@@ -366,13 +516,12 @@ async function imapMoveToTrash(box, uid) {
                 });
             });
         }
-    } finally {
-        if (conn) conn.end();
-    }
+    });
 }
 
 
-app.post('/upload', (req, res) => {
+
+app.post('/upload', requireAuth, (req, res) => {
     const filename = (req.query.name || 'attachment').replace(/[^a-zA-Z0-9._-]/g, '_');
     const uniqueName = `temp_${Date.now()}_${filename}`;
     const savePath = path.join(TEMP_UPLOAD_PATH, uniqueName);
@@ -392,7 +541,7 @@ app.post('/upload', (req, res) => {
 });
 
 
-app.get(['/inbox', '/sentbox', '/trashbox', '/spambox'], async (req, res) => {
+app.get(['/inbox', '/sentbox', '/trashbox', '/spambox'], requireAuth, async (req, res) => {
     let box = 'inbox';
     if (req.path === '/sentbox') box = 'sent';
     else if (req.path === '/trashbox') box = 'trash';
@@ -402,9 +551,17 @@ app.get(['/inbox', '/sentbox', '/trashbox', '/spambox'], async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
     const limit = Math.max(1, parseInt(req.query.limit, 10) || 25);
 
+    const cacheKey = `${box}:${page}:${limit}:${query}`;
+    const cached = getCachedList(cacheKey);
+    if (cached) {
+        return res.json(cached);
+    }
+
     try {
         const mails = await imapFetchList(box, page, limit, query);
-        res.json(sanitizeUnicodeBMP(mails));
+        const sanitized = sanitizeUnicodeBMP(mails);
+        setCacheList(cacheKey, sanitized);
+        res.json(sanitized);
     } catch (err) {
         console.error('[IMAP List Error]', err.message);
         res.json([]);
@@ -412,7 +569,7 @@ app.get(['/inbox', '/sentbox', '/trashbox', '/spambox'], async (req, res) => {
 });
 
 
-app.get('/detail', async (req, res) => {
+app.get('/detail', requireAuth, async (req, res) => {
     const box = req.query.box;
     const uid = req.query.id;
     if (!uid) return res.status(400).json({ error: 'Missing id' });
@@ -428,7 +585,7 @@ app.get('/detail', async (req, res) => {
 });
 
 
-app.post('/send', async (req, res) => {
+app.post('/send', requireAuth, async (req, res) => {
     const { to, subject, body, attachments } = req.body;
     if (!to) return res.status(400).send('Missing recipient');
 
@@ -461,6 +618,7 @@ app.post('/send', async (req, res) => {
             attachments: mailAttachments
         });
         console.log(`[SMTP] Sent → ${to} | "${subject}" | msgId: ${info.messageId}`);
+        invalidateCache();
         res.send('OK');
 
         for (const p of pathsToClean) {
@@ -475,68 +633,64 @@ app.post('/send', async (req, res) => {
 });
 
 
-app.post('/spam', async (req, res) => {
+app.post('/spam', requireAuth, async (req, res) => {
     const box = req.body.box;
     const uid = req.body.id;
     if (!uid) return res.status(400).send('Missing id');
 
     const folder = GMAIL_FOLDER[box] || 'INBOX';
-    let conn;
     try {
-        conn = await imaps.connect(IMAP_CONFIG);
-        await conn.openBox(folder);
-
-        await new Promise((resolve, reject) => {
-            conn.imap.move(String(uid), '[Gmail]/Spam', (err) => {
-                if (err) reject(err);
-                else resolve();
+        await withImap(async (conn) => {
+            await conn.openBox(folder);
+            await new Promise((resolve, reject) => {
+                conn.imap.move(String(uid), '[Gmail]/Spam', (err) => {
+                    if (err) reject(err);
+                    else resolve();
+                });
             });
         });
         console.log(`[IMAP] Moved UID ${uid} (${box}) → Spam`);
+        invalidateCache();
         res.send('OK');
     } catch (err) {
         console.error('[IMAP Spam Error]', err.message);
         res.status(500).send('ERROR');
-    } finally {
-        if (conn) conn.end();
     }
 });
 
-app.post('/empty', async (req, res) => {
+app.post('/empty', requireAuth, async (req, res) => {
     const box = req.body.box;
     if (box !== 'trash' && box !== 'spam') {
         return res.status(400).send('Invalid box');
     }
 
     const folder = GMAIL_FOLDER[box];
-    let conn;
     try {
-        conn = await imaps.connect(IMAP_CONFIG);
-        await conn.openBox(folder);
-
-        const messages = await conn.search(['ALL'], { markSeen: false });
-        if (messages.length > 0) {
-            const uids = messages.map(msg => String(msg.attributes.uid));
-            await conn.addFlags(uids, ['\\Deleted']);
-            await new Promise((resolve, reject) => {
-                conn.imap.expunge((err) => {
-                    if (err) reject(err);
-                    else resolve();
+        await withImap(async (conn) => {
+            await conn.openBox(folder);
+            const messages = await conn.search(['ALL'], { markSeen: false });
+            if (messages.length > 0) {
+                const uids = messages.map(msg => String(msg.attributes.uid));
+                await conn.addFlags(uids, ['\\Deleted']);
+                await new Promise((resolve, reject) => {
+                    conn.imap.expunge((err) => {
+                        if (err) reject(err);
+                        else resolve();
+                    });
                 });
-            });
-        }
+            }
+        });
         console.log(`[IMAP] Expunged all messages in ${box}`);
+        invalidateCache();
         res.send('OK');
     } catch (err) {
         console.error('[IMAP Empty Error]', err.message);
         res.status(500).send('ERROR');
-    } finally {
-        if (conn) conn.end();
     }
 });
 
 
-app.post('/delete', async (req, res) => {
+app.post('/delete', requireAuth, async (req, res) => {
     const box = req.body.box;
     const uid = req.body.id;
     if (!uid) return res.status(400).send('Missing id');
@@ -544,6 +698,7 @@ app.post('/delete', async (req, res) => {
     try {
         await imapMoveToTrash(box, uid);
         console.log(`[IMAP] Moved UID ${uid} (${box}) → Trash`);
+        invalidateCache();
         res.send('OK');
     } catch (err) {
         console.error('[IMAP Delete Error]', err.message);
@@ -552,7 +707,7 @@ app.post('/delete', async (req, res) => {
 });
 
 
-app.get('/read', async (req, res) => {
+app.get('/read', requireAuth, async (req, res) => {
     const uid = req.query.id;
     const box = req.query.box === 'sent' ? 'sent' : 'inbox';
     if (uid) {
@@ -568,14 +723,32 @@ app.get('/download/:name', (req, res) => {
     else res.status(404).send('Attachment not found');
 });
 
-// ─── Start Server ─────────────────────────────────────────────────────────────
+
+
 app.listen(PORT, '0.0.0.0', () => {
     console.log('');
     console.log('  ╔══════════════════════════════════════════╗');
-    console.log('  ║      MAXMAIL MASTER SERVER  v4.0         ║');
+    console.log('  ║      MAXMAIL MASTER SERVER  v0.2         ║');
     console.log('  ║      Gmail Bridge  (IMAP + SMTP)         ║');
     console.log(`  ║  Account : ${GMAIL_USER.padEnd(30)} ║`);
     console.log(`  ║  Address : http://0.0.0.0:${PORT}           ║`);
+    console.log('  ╠══════════════════════════════════════════╣');
+
+    const devices = loadPairedDevices();
+    console.log(`  ║  Paired  : ${String(devices.devices.length).padEnd(30)} ║`);
+
+    if (pairPin) {
+        console.log('  ╠══════════════════════════════════════════╣');
+        console.log('  ║   PAIRING MODE ACTIVE                  ║');
+        console.log(`  ║  PIN    : ${pairPin.padEnd(31)} ║`);
+        console.log('  ║  Expires: 5 minutes from start           ║');
+        console.log('  ║  Enter this PIN in app Settings to pair  ║');
+    } else {
+        console.log('  ╠══════════════════════════════════════════╣');
+        console.log('  ║  To pair a new device, restart with:     ║');
+        console.log('  ║  PAIR_MODE=true node server.js           ║');
+    }
+
     console.log('  ╚══════════════════════════════════════════╝');
     console.log('');
 });
