@@ -10,9 +10,11 @@ import java.util.*;
 public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCommandListener {
     private Display display;
     private List inboxList;
-    private Form detailsForm, loadingForm, composeForm, settingsForm;
-    private TextField toField, subjectField, bodyField, serverUrlField;
+    private Form detailsForm, loadingForm, composeForm, settingsForm, loginForm;
+    private TextField toField, subjectField, bodyField, serverUrlField, pairPinField;
+    private StringItem loginTitle, loginStatus;
     private Command exitCmd, backCmd, refreshCmd, composeCmd, sendCmd, deleteCmd, replyCmd, sentboxCmd, inboxCmd, searchCmd, settingsCmd, saveSettingsCmd;
+    private Command loginCmd, pairCmd;
 
     private List fileBrowserList, foldersList;
     private Command attachCmd, browseBackCmd, selectFileCmd, foldersCmd, markSpamCmd, emptyFolderCmd;
@@ -26,13 +28,18 @@ public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCom
     private int currentPage = 1;
     private static final int PAGE_LIMIT = 25;
 
-    private int task = 0; 
+    private int task = 0;
     
     private Vector mailIds = new Vector();
     private Vector attachUrls = new Vector();
     private Vector attachmentItems = new Vector(); 
     private String selectedId = "";
     private Hashtable activeMail;
+
+    private String pairToken;
+    private String sessionToken;
+
+    private byte[] httpBuf = new byte[2048];
 
     public void startApp() {
         if (display == null) {
@@ -51,6 +58,8 @@ public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCom
             replyCmd = new Command("Reply", Command.OK, 1);
             sendCmd = new Command("Send", Command.OK, 1);
             saveSettingsCmd = new Command("Save", Command.OK, 1);
+            loginCmd = new Command("Login", Command.OK, 1);
+            pairCmd = new Command("Pair Device", Command.SCREEN, 2);
             
             attachCmd = new Command("Attach File", Command.SCREEN, 10);
             selectFileCmd = new Command("Attach", Command.OK, 1);
@@ -59,6 +68,15 @@ public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCom
             foldersCmd = new Command("Folders", Command.SCREEN, 5);
             markSpamCmd = new Command("Spam", Command.SCREEN, 10);
             emptyFolderCmd = new Command("Empty Folder", Command.SCREEN, 11);
+
+            loginForm = new Form("MaxMail");
+            loginTitle = new StringItem(null, "\n\nMaxMail\n\n");
+            loginTitle.setFont(Font.getFont(Font.FACE_SYSTEM, Font.STYLE_BOLD, Font.SIZE_LARGE));
+            loginStatus = new StringItem(null, "");
+            loginForm.append(loginTitle);
+            loginForm.append(loginStatus);
+            loginForm.addCommand(exitCmd);
+            loginForm.setCommandListener(this);
 
             inboxList = new List("MaxMail", List.IMPLICIT);
             inboxList.setTicker(new Ticker("MaxMail Active Server: " + serverUrl));
@@ -92,11 +110,16 @@ public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCom
             composeForm.addCommand(attachCmd);
             composeForm.setCommandListener(this);
 
-            settingsForm = new Form("Server Settings");
+            settingsForm = new Form("Settings");
             serverUrlField = new TextField("Server URL:", serverUrl, 150, TextField.URL);
+            pairPinField = new TextField("Pair PIN:", "", 6, TextField.NUMERIC);
             settingsForm.append(serverUrlField);
+            settingsForm.append(new StringItem(null, "\n"));
+            settingsForm.append(pairPinField);
+            settingsForm.append(new StringItem(null, "Start server with PAIR_MODE=true\nto get a PIN for pairing."));
             settingsForm.addCommand(backCmd);
             settingsForm.addCommand(saveSettingsCmd);
+            settingsForm.addCommand(pairCmd);
             settingsForm.setCommandListener(this);
 
             loadingForm = new Form("Connecting");
@@ -115,8 +138,50 @@ public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCom
             foldersList.addCommand(browseBackCmd);
             foldersList.setCommandListener(this);
 
-            doTask(0);
+            pairToken = SettingsStore.loadPairToken();
+            sessionToken = SettingsStore.loadSessionToken();
+
+            if (pairToken != null && pairToken.length() > 0) {
+                if (sessionToken != null && sessionToken.length() > 0) {
+                    doTask(0);
+                } else {
+                    showLoginScreen("Tap Login to connect.");
+                }
+            } else {
+                showLoginScreen("Device not paired.\nOpen Settings to pair.");
+            }
         }
+    }
+
+    private void showLoginScreen(String message) {
+        loginStatus.setText(message);
+        loginForm.removeCommand(loginCmd);
+        loginForm.removeCommand(settingsCmd);
+
+        if (pairToken != null && pairToken.length() > 0) {
+            loginForm.addCommand(loginCmd);
+            loginForm.addCommand(settingsCmd);
+        } else {
+            loginForm.addCommand(settingsCmd);
+        }
+        display.setCurrent(loginForm);
+    }
+
+    private String boxParam() {
+        if (currentBox.equals("/sentbox")) return "sent";
+        if (currentBox.equals("/trashbox")) return "trash";
+        if (currentBox.equals("/spambox")) return "spam";
+        return "inbox";
+    }
+
+    private void handleAuthExpired() {
+        sessionToken = null;
+        SettingsStore.saveSessionToken(null);
+        display.callSerially(new Runnable() {
+            public void run() {
+                showLoginScreen("Session expired.\nTap Login to reconnect.");
+            }
+        });
     }
 
     private void doTask(int t) {
@@ -127,41 +192,52 @@ public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCom
 
     public void run() {
         try {
-            if (task == 0) { 
-                String url = serverUrl + currentBox + "?q=" + NetworkHelper.urlEncode(searchQuery) + 
-                             "&page=" + currentPage + "&limit=" + PAGE_LIMIT;
-                final String res = fetchHttp(url, null);
+            if (task == 0) {
+                StringBuffer urlBuf = new StringBuffer(128);
+                urlBuf.append(serverUrl).append(currentBox);
+                urlBuf.append("?q=").append(NetworkHelper.urlEncode(searchQuery));
+                urlBuf.append("&page=").append(currentPage);
+                urlBuf.append("&limit=").append(PAGE_LIMIT);
+
+                final String res = fetchHttp(urlBuf.toString(), null);
+                if (res == null) { handleAuthExpired(); return; }
                 display.callSerially(new Runnable() { public void run() { updateUI(res); } });
-            } else if (task == 4) { 
-                String b = "inbox";
-                if (currentBox.equals("/sentbox")) b = "sent";
-                else if (currentBox.equals("/trashbox")) b = "trash";
-                else if (currentBox.equals("/spambox")) b = "spam";
-                
-                final String res = fetchHttp(serverUrl + "/detail?id=" + selectedId + "&box=" + b, null);
+
+            } else if (task == 4) {
+                String b = boxParam();
+                StringBuffer urlBuf = new StringBuffer(96);
+                urlBuf.append(serverUrl).append("/detail?id=").append(selectedId).append("&box=").append(b);
+
+                final String res = fetchHttp(urlBuf.toString(), null);
+                if (res == null) { handleAuthExpired(); return; }
                 display.callSerially(new Runnable() { public void run() { 
                     try { activeMail = (Hashtable) MiniJSON.parse(res); showDetailUI(); } catch(Exception e){}
                 } });
-            } else if (task == 1) { 
+
+            } else if (task == 1) {
                 StringBuffer serverAttaches = new StringBuffer();
                 for (int idx = 0; idx < attachmentsList.size(); idx++) {
                     String filePath = (String) attachmentsList.elementAt(idx);
                     int lastSlash = filePath.lastIndexOf('/');
                     String name = (lastSlash != -1) ? filePath.substring(lastSlash + 1) : "file";
                     
-                    String uploadUrl = serverUrl + "/upload?name=" + NetworkHelper.urlEncode(name);
-                    String uniqueName = uploadFile(uploadUrl, filePath);
+                    StringBuffer uploadUrlBuf = new StringBuffer(96);
+                    uploadUrlBuf.append(serverUrl).append("/upload?name=").append(NetworkHelper.urlEncode(name));
+                    String uniqueName = uploadFile(uploadUrlBuf.toString(), filePath);
                     if (uniqueName != null && uniqueName.trim().length() > 0) {
                         if (serverAttaches.length() > 0) serverAttaches.append(",");
                         serverAttaches.append(uniqueName.trim());
                     }
                 }
                 
-                String postBody = "to=" + NetworkHelper.urlEncode(toField.getString()) +
-                                  "&subject=" + NetworkHelper.urlEncode(subjectField.getString()) +
-                                  "&body=" + NetworkHelper.urlEncode(bodyField.getString()) +
-                                  "&attachments=" + NetworkHelper.urlEncode(serverAttaches.toString());
-                fetchHttp(serverUrl + "/send", postBody);
+                StringBuffer postBody = new StringBuffer(256);
+                postBody.append("to=").append(NetworkHelper.urlEncode(toField.getString()));
+                postBody.append("&subject=").append(NetworkHelper.urlEncode(subjectField.getString()));
+                postBody.append("&body=").append(NetworkHelper.urlEncode(bodyField.getString()));
+                postBody.append("&attachments=").append(NetworkHelper.urlEncode(serverAttaches.toString()));
+
+                String sendRes = fetchHttp(serverUrl + "/send", postBody.toString());
+                if (sendRes == null) { handleAuthExpired(); return; }
                 display.callSerially(new Runnable() {
                     public void run() {
                         Alert success = new Alert("Sent", "Mail sent successfully.", null, AlertType.CONFIRMATION);
@@ -172,13 +248,11 @@ public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCom
                 searchQuery = ""; 
                 currentPage = 1; 
                 doTask(0);
-            } else if (task == 2) { 
-                String b = "inbox";
-                if (currentBox.equals("/sentbox")) b = "sent";
-                else if (currentBox.equals("/trashbox")) b = "trash";
-                else if (currentBox.equals("/spambox")) b = "spam";
-                
-                fetchHttp(serverUrl + "/delete", "id=" + selectedId + "&box=" + b);
+
+            } else if (task == 2) {
+                String b = boxParam();
+                String delRes = fetchHttp(serverUrl + "/delete", "id=" + selectedId + "&box=" + b);
+                if (delRes == null) { handleAuthExpired(); return; }
                 display.callSerially(new Runnable() {
                     public void run() {
                         removeMailLocally(selectedId);
@@ -187,13 +261,11 @@ public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCom
                         display.setCurrent(success, inboxList);
                     }
                 });
+
             } else if (task == 5) {
-                String b = "inbox";
-                if (currentBox.equals("/sentbox")) b = "sent";
-                else if (currentBox.equals("/trashbox")) b = "trash";
-                else if (currentBox.equals("/spambox")) b = "spam";
-                
-                fetchHttp(serverUrl + "/spam", "id=" + selectedId + "&box=" + b);
+                String b = boxParam();
+                String spamRes = fetchHttp(serverUrl + "/spam", "id=" + selectedId + "&box=" + b);
+                if (spamRes == null) { handleAuthExpired(); return; }
                 display.callSerially(new Runnable() {
                     public void run() {
                         removeMailLocally(selectedId);
@@ -202,9 +274,11 @@ public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCom
                         display.setCurrent(success, inboxList);
                     }
                 });
+
             } else if (task == 6) {
                 String b = currentBox.equals("/trashbox") ? "trash" : "spam";
-                fetchHttp(serverUrl + "/empty", "box=" + b);
+                String emptyRes = fetchHttp(serverUrl + "/empty", "box=" + b);
+                if (emptyRes == null) { handleAuthExpired(); return; }
                 display.callSerially(new Runnable() {
                     public void run() {
                         inboxList.deleteAll();
@@ -215,7 +289,50 @@ public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCom
                         display.setCurrent(success, inboxList);
                     }
                 });
+
+            } else if (task == 7) {
+                String pin = pairPinField.getString().trim();
+                final String res = fetchHttp(serverUrl + "/pair", "pin=" + NetworkHelper.urlEncode(pin));
+                if (res == null) {
+                    display.callSerially(new Runnable() {
+                        public void run() {
+                            Alert error = new Alert("Pair Failed",
+                                "Invalid PIN or pairing not active.\nStart server with PAIR_MODE=true",
+                                null, AlertType.ERROR);
+                            error.setTimeout(Alert.FOREVER);
+                            display.setCurrent(error, settingsForm);
+                        }
+                    });
+                    return;
+                }
+                Hashtable result = (Hashtable) MiniJSON.parse(res);
+                pairToken = result.get("token").toString();
+                SettingsStore.savePairToken(pairToken);
+                doTask(8);
+                return;
+
+            } else if (task == 8) {
+                String minuteStr = AuthHelper.getUtcMinuteString();
+                String authId = AuthHelper.generateAuthId(pairToken, minuteStr);
+                final String res = fetchHttp(serverUrl + "/login", "authId=" + NetworkHelper.urlEncode(authId));
+                if (res == null) {
+                    display.callSerially(new Runnable() {
+                        public void run() {
+                            showLoginScreen("Authentication failed.\nCheck device clock.");
+                        }
+                    });
+                    return;
+                }
+                Hashtable result = (Hashtable) MiniJSON.parse(res);
+                sessionToken = result.get("session").toString();
+                SettingsStore.saveSessionToken(sessionToken);
+                searchQuery = "";
+                currentPage = 1;
+                currentBox = "/inbox";
+                doTask(0);
+                return;
             }
+
         } catch (final Exception e) {
             display.callSerially(new Runnable() { 
                 public void run() { 
@@ -223,7 +340,10 @@ public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCom
                         "Could not connect to server.\nVerify IP address and settings.\n\nError: " + e.getMessage(), 
                         null, AlertType.ERROR);
                     alert.setTimeout(Alert.FOREVER);
-                    display.setCurrent(alert, inboxList); 
+
+                    Displayable fallback = (sessionToken != null && sessionToken.length() > 0) ? 
+                        (Displayable) inboxList : (Displayable) loginForm;
+                    display.setCurrent(alert, fallback); 
                 } 
             });
         }
@@ -258,19 +378,25 @@ public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCom
         try {
             Vector mails = (Vector) MiniJSON.parse(json);
             count = mails.size();
+            boolean isInbox = currentBox.equals("/inbox");
+
             for (int i = 0; i < count; i++) {
                 Hashtable m = (Hashtable) mails.elementAt(i);
-                mailIds.addElement(m.get("id"));
-                String a = (m.get("hasAttachments").toString().equals("true")) ? "[A] " : "    ";
-                String u = (currentBox.equals("/inbox") && m.get("read").toString().equals("false")) ? "(!) " : "    ";
-                String date = m.containsKey("date") ? m.get("date").toString() : "";
+                mailIds.addElement(m.get("i"));
+
+                String attachFlag = "true".equals(m.get("a")) ? "[A] " : "    ";
+                String unreadFlag = (isInbox && "false".equals(m.get("r"))) ? "(!) " : "    ";
                 
-                String firstLine = u + a + m.get("sender");
+                Object dateObj = m.get("d");
+                String date = (dateObj != null && dateObj != MiniJSON.JSON_NULL) ? dateObj.toString() : "";
+                
+                StringBuffer line = new StringBuffer(80);
+                line.append(unreadFlag).append(attachFlag).append(m.get("f"));
                 if (date.length() > 0) {
-                    firstLine += " - " + date;
+                    line.append(" - ").append(date);
                 }
-                
-                inboxList.append(firstLine + "\n" + m.get("subject"), null);
+                line.append('\n').append(m.get("s"));
+                inboxList.append(line.toString(), null);
             }
         } catch (Exception e) { 
             if (inboxList.size() == 0) {
@@ -317,23 +443,24 @@ public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCom
         attachUrls.removeAllElements();
         attachmentItems.removeAllElements();
         
-        detailsForm.setTitle(activeMail.get("subject").toString());
+        detailsForm.setTitle(activeMail.get("s").toString());
         
-        String toStr = activeMail.containsKey("to") ? activeMail.get("to").toString() : "";
-        StringItem header = new StringItem(null, "From: " + activeMail.get("sender") + 
+        Object toObj = activeMail.get("t");
+        String toStr = (toObj != null && toObj != MiniJSON.JSON_NULL) ? toObj.toString() : "";
+        StringItem header = new StringItem(null, "From: " + activeMail.get("f") + 
                                                 "\nTo: " + toStr + 
-                                                "\nDate: " + activeMail.get("date") + "\n\n");
+                                                "\nDate: " + activeMail.get("d") + "\n\n");
         header.setFont(Font.getFont(Font.FACE_SYSTEM, Font.STYLE_BOLD, Font.SIZE_SMALL));
         detailsForm.append(header);
-        detailsForm.append(new StringItem(null, activeMail.get("body").toString() + "\n\n"));
+        detailsForm.append(new StringItem(null, activeMail.get("b").toString() + "\n\n"));
         
-        Vector attaches = (Vector) activeMail.get("attachments");
+        Vector attaches = (Vector) activeMail.get("at");
         if (attaches != null && attaches.size() > 0) {
             detailsForm.append(new StringItem(null, "--- ATTACHMENTS ---"));
             for (int i = 0; i < attaches.size(); i++) {
                 Hashtable at = (Hashtable) attaches.elementAt(i);
-                attachUrls.addElement(at.get("url"));
-                StringItem fileLink = new StringItem(null, "[" + at.get("name") + "]", Item.BUTTON);
+                attachUrls.addElement(at.get("u"));
+                StringItem fileLink = new StringItem(null, "[" + at.get("n") + "]", Item.BUTTON);
                 fileLink.setDefaultCommand(new Command("Open", Command.ITEM, 1));
                 fileLink.setItemCommandListener(this);
                 
@@ -468,11 +595,34 @@ public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCom
             } else if (c == browseBackCmd) {
                 display.setCurrent(inboxList);
             }
+        } else if (d == loginForm) {
+            if (c == exitCmd) {
+                notifyDestroyed();
+            } else if (c == loginCmd) {
+                if (pairToken != null && pairToken.length() > 0) {
+                    loginStatus.setText("Authenticating...");
+                    doTask(8);
+                }
+            } else if (c == settingsCmd) {
+                serverUrlField.setString(serverUrl);
+                pairPinField.setString("");
+                display.setCurrent(settingsForm);
+            }
         } else {
             if (c == exitCmd) {
                 notifyDestroyed();
             } else if (c == backCmd) {
-                display.setCurrent(inboxList);
+                if (d == settingsForm) {
+                    if (pairToken == null || pairToken.length() == 0) {
+                        showLoginScreen("Device not paired.\nOpen Settings to pair.");
+                    } else if (sessionToken == null || sessionToken.length() == 0) {
+                        showLoginScreen("Tap Login to connect.");
+                    } else {
+                        display.setCurrent(inboxList);
+                    }
+                } else {
+                    display.setCurrent(inboxList);
+                }
             } else if (c == refreshCmd) {
                 searchQuery = ""; 
                 currentPage = 1; 
@@ -496,6 +646,7 @@ public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCom
                 doTask(6);
             } else if (c == settingsCmd) {
                 serverUrlField.setString(serverUrl);
+                pairPinField.setString("");
                 display.setCurrent(settingsForm);
             } else if (c == saveSettingsCmd) {
                 String newUrl = serverUrlField.getString().trim();
@@ -509,10 +660,19 @@ public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCom
                     
                     Alert success = new Alert("Settings Saved", "Server URL has been saved persistently.", null, AlertType.CONFIRMATION);
                     success.setTimeout(2000);
-                    display.setCurrent(success, inboxList);
+                    display.setCurrent(success, settingsForm);
                 } else {
                     Alert error = new Alert("Error", "Server URL cannot be empty.", null, AlertType.ERROR);
                     error.setTimeout(2000);
+                    display.setCurrent(error, settingsForm);
+                }
+            } else if (c == pairCmd) {
+                String pin = pairPinField.getString().trim();
+                if (pin.length() > 0) {
+                    doTask(7);
+                } else {
+                    Alert error = new Alert("Error", "Enter the 6-digit PIN\nfrom server console.", null, AlertType.ERROR);
+                    error.setTimeout(3000);
                     display.setCurrent(error, settingsForm);
                 }
             } else if (c == searchCmd) {
@@ -547,14 +707,14 @@ public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCom
                 doTask(2);
             } else if (c == replyCmd) {
                 String replyTo = "";
-                if (activeMail.containsKey("senderEmail")) {
-                    Object emailObj = activeMail.get("senderEmail");
+                if (activeMail.containsKey("e")) {
+                    Object emailObj = activeMail.get("e");
                     if (emailObj != null && emailObj != MiniJSON.JSON_NULL) {
                         replyTo = emailObj.toString().trim();
                     }
                 }
                 if (replyTo.length() == 0) {
-                    String sender = activeMail.get("sender").toString();
+                    String sender = activeMail.get("f").toString();
                     int start = sender.indexOf('<');
                     int end = sender.indexOf('>');
                     if (start != -1 && end != -1 && end > start) {
@@ -564,8 +724,8 @@ public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCom
                     }
                 }
                 toField.setString(replyTo);
-                subjectField.setString("Re: " + activeMail.get("subject"));
-                bodyField.setString("\n\n---Original---\n" + activeMail.get("body"));
+                subjectField.setString("Re: " + activeMail.get("s"));
+                bodyField.setString("\n\n---Original---\n" + activeMail.get("b"));
                 attachmentsList.removeAllElements();
                 updateAttachmentsLabel();
                 display.setCurrent(composeForm);
@@ -589,10 +749,13 @@ public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCom
     }
 
     private String fetchHttp(String url, String post) throws IOException {
+        if (sessionToken != null && sessionToken.length() > 0) {
+            url += (url.indexOf('?') >= 0 ? "&" : "?") + "token=" + NetworkHelper.urlEncode(sessionToken);
+        }
+
         HttpConnection h = null; 
         InputStream i = null; 
-        OutputStream o = null; 
-        StringBuffer s = new StringBuffer();
+        OutputStream o = null;
         try {
             h = (HttpConnection) Connector.open(NetworkHelper.makeBBUrl(url));
             if (post != null) {
@@ -602,30 +765,37 @@ public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCom
                 o.write(post.getBytes("UTF-8")); 
                 o.flush();
             }
-            if (h.getResponseCode() == HttpConnection.HTTP_OK) {
-                i = h.openInputStream(); 
-                byte[] buf = new byte[1024];
+            int rc = h.getResponseCode();
+            if (rc == 401) {
+                return null;
+            }
+            if (rc == HttpConnection.HTTP_OK) {
+                i = h.openInputStream();
+                StringBuffer s = new StringBuffer(4096);
                 int len;
-                while ((len = i.read(buf)) != -1) {
-                    s.append(new String(buf, 0, len, "UTF-8"));
+                while ((len = i.read(httpBuf)) != -1) {
+                    s.append(new String(httpBuf, 0, len, "UTF-8"));
                 }
+                return s.toString();
             } else {
-                throw new IOException("HTTP code " + h.getResponseCode());
+                throw new IOException("HTTP " + rc);
             }
         } finally { 
             if (o != null) { try { o.close(); } catch(Exception e){} }
             if (i != null) { try { i.close(); } catch(Exception e){} } 
             if (h != null) { try { h.close(); } catch(Exception e){} } 
         }
-        return s.toString();
     }
 
     private String uploadFile(String url, String filePath) throws IOException {
+        if (sessionToken != null && sessionToken.length() > 0) {
+            url += (url.indexOf('?') >= 0 ? "&" : "?") + "token=" + NetworkHelper.urlEncode(sessionToken);
+        }
+
         HttpConnection h = null; 
         InputStream fileInput = null;
         OutputStream o = null; 
         InputStream responseInput = null;
-        StringBuffer s = new StringBuffer();
         FileConnection fc = null;
         try {
             fc = (FileConnection) Connector.open(filePath);
@@ -638,23 +808,27 @@ public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCom
             h.setRequestProperty("Content-Type", "application/octet-stream");
             h.setRequestProperty("Content-Length", String.valueOf(size));
             
-            o = h.openOutputStream(); 
-            byte[] buf = new byte[2048];
+            o = h.openOutputStream();
             int len;
-            while ((len = fileInput.read(buf)) != -1) {
-                o.write(buf, 0, len);
+            while ((len = fileInput.read(httpBuf)) != -1) {
+                o.write(httpBuf, 0, len);
             }
             o.flush();
             
-            if (h.getResponseCode() == HttpConnection.HTTP_OK) {
-                responseInput = h.openInputStream(); 
-                byte[] resBuf = new byte[1024];
+            int rc = h.getResponseCode();
+            if (rc == 401) {
+                return null;
+            }
+            if (rc == HttpConnection.HTTP_OK) {
+                responseInput = h.openInputStream();
+                StringBuffer s = new StringBuffer(128);
                 int resLen;
-                while ((resLen = responseInput.read(resBuf)) != -1) {
-                    s.append(new String(resBuf, 0, resLen, "UTF-8"));
+                while ((resLen = responseInput.read(httpBuf)) != -1) {
+                    s.append(new String(httpBuf, 0, resLen, "UTF-8"));
                 }
+                return s.toString();
             } else {
-                throw new IOException("HTTP code " + h.getResponseCode());
+                throw new IOException("HTTP " + rc);
             }
         } finally { 
             if (fileInput != null) { try { fileInput.close(); } catch(Exception e){} }
@@ -663,7 +837,6 @@ public class Midlet extends MIDlet implements CommandListener, Runnable, ItemCom
             if (responseInput != null) { try { responseInput.close(); } catch(Exception e){} } 
             if (h != null) { try { h.close(); } catch(Exception e){} } 
         }
-        return s.toString();
     }
 
     public void pauseApp() {}

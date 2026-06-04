@@ -4,3 +4,4 @@ inbox.json
 sent.json
 node_modules/
 *.log
+paired_devices.json
